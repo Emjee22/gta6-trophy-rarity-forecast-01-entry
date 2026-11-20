@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GTA VI trophy rarity forecaster.
+"""GTA VI trophy rarity forecaster, version 2.
 
 make.fun competition gta6-trophy-rarity-forecast-01: forecast every PS5
 trophy's Exophase earn rate at a target instant, as five quantiles, from
@@ -34,15 +34,24 @@ lucky trophy cannot claim false precision), the regression prediction
 error which widens as the target moves away from the data, half the
 disagreement between the two views, and a horizon term that grows like
 a random walk. The 5% / 95% band is meant to cover about 90% of the
-time.
+time, so the fitted spread is calibrated (scaled) toward that coverage
+rather than left wide.
+
+Fits are recency-weighted: over a two-day history the growth pattern
+drifts (the launch surge fades), so a recent read counts more than one
+from launch night. The weight halves every HALF_LIFE_H hours before
+the checkpoint. The residual scale stays an unweighted pooled measure,
+so the trend adapts while the noise estimate stays stable.
 
 When the history is flat -- every read shows the same players and the
 same rates, which is what Exophase looks like before its first refresh
 -- there is no trend to fit. The model then falls back to a
 launch-dynamics dilution prior instead of pretending the stale page
-will persist: players are assumed to grow like (1 + hours since
-launch) and earners more slowly, so rates fall, with a wide spread
-because the size of the coming refresh is genuinely unknown.
+will persist: on launch day new players flood in far faster than
+trophies are earned, so players are assumed to grow like
+(1 + hours since launch) and earners much more slowly, so rates fall,
+with a wide spread because the size of the coming refresh is genuinely
+unknown.
 
 A trophy stuck at 100% is forecast at 100% with only a small lower
 tail. A trophy never seen in any read gets its tier's typical rate
@@ -62,17 +71,19 @@ Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
 
 # Launch-dynamics prior used only when the history is flat.
 D_PRIOR = 1.0    # players grow like (1 + hours since launch) ** D_PRIOR
-B_PRIOR = 0.3    # earners grow like (1 + hours since launch) ** B_PRIOR
+B_PRIOR = 0.2    # earners grow like (1 + hours since launch) ** B_PRIOR
 SIGMA_FLAT = 1.2  # logit spread when no refresh has been seen yet
 
 K_SHRINK = 6.0   # prior strength when shrinking a slope to its tier mean
 SIGMA_H_COEF = 0.25  # horizon term: SIGMA_H_COEF * sqrt(days ahead)
-SIGMA_FLOOR = 0.25
+SIGMA_FLOOR = 0.20
 SIGMA_CAP = 2.0
+SIGMA_SCALE = 0.75  # spread calibration toward ~90% coverage
 D_CAP = 2.0      # fastest players growth (log slope) allowed
 B_CAP = 3.0      # fastest earners growth (log slope) allowed
 BETA_CAP = 3.0   # fastest logit-rate slope allowed
 P_MULT_CAP = 50.0  # players forecast never exceeds this x the last count
+HALF_LIFE_H = 24.0  # recency weight halves every this many hours
 
 # Typical rate (percent) for a trophy never observed, by tier.
 TIER_PRIOR = {"platinum": 0.10, "gold": 0.50, "silver": 1.00,
@@ -129,34 +140,45 @@ def log_time(t, t0):
     return math.log1p(h)
 
 
-def ols(xs, ys):
-    """Least squares y = a + b*x.
+def recency_weight(read_time, checkpoint):
+    """Weight of a read: halves every HALF_LIFE_H hours before checkpoint."""
+    age_h = (checkpoint - read_time).total_seconds() / 3600.0
+    if age_h <= 0.0:
+        return 1.0
+    return 0.5 ** (age_h / HALF_LIFE_H)
 
-    Returns (a, b, s, xbar, sxx) where s is the residual standard
-    deviation (0.0 for a two-point fit), or None when the slope is
-    not identified (fewer than 2 points, or no spread in x).
+
+def wols(xs, ys, ws):
+    """Recency-weighted least squares y = a + b*x.
+
+    Returns (a, b, s, xbar, sxx) where s is the weighted residual RMS
+    (0.0 for a two-point fit), or None when the slope is not identified
+    (fewer than 2 points, or no spread in x).
     """
     n = len(xs)
     if n < 2:
         return None
-    xbar = sum(xs) / n
-    ybar = sum(ys) / n
+    wsum = sum(ws)
+    if wsum <= 0.0:
+        return None
+    xbar = sum(w * x for w, x in zip(ws, xs)) / wsum
+    ybar = sum(w * y for w, y in zip(ws, ys)) / wsum
     sxx = 0.0
     sxy = 0.0
-    for x, y in zip(xs, ys):
+    for w, x, y in zip(ws, xs, ys):
         dx = x - xbar
-        sxx += dx * dx
-        sxy += dx * (y - ybar)
+        sxx += w * dx * dx
+        sxy += w * dx * (y - ybar)
     if sxx <= 1e-12:
         return None
     b = sxy / sxx
     a = ybar - b * xbar
     if n > 2:
         ss = 0.0
-        for x, y in zip(xs, ys):
+        for w, x, y in zip(ws, xs, ys):
             r = y - (a + b * x)
-            ss += r * r
-        s = math.sqrt(ss / (n - 2))
+            ss += w * r * r
+        s = math.sqrt(ss / wsum)
     else:
         s = 0.0
     return (a, b, s, xbar, sxx)
@@ -205,13 +227,13 @@ def dedupe_reads(history):
     return out
 
 
-def fit_players(reads, t0, x_target, p_last, x_last):
+def fit_players(reads, t0, x_target, p_last, x_last, checkpoint):
     """Forecast players_tracked at the target.
 
     log players is linear in log-time, fitted on the distinct reads
-    and anchored at the last observed count, so the forecast grows
-    from where the page actually is. Floored at the last count
-    (tracked players do not shrink) and capped at a generous
+    (recency-weighted) and anchored at the last observed count, so the
+    forecast grows from where the page actually is. Floored at the last
+    count (tracked players do not shrink) and capped at a generous
     multiple of it.
     """
     pts = []
@@ -222,12 +244,13 @@ def fit_players(reads, t0, x_target, p_last, x_last):
                 t = parse_time(r["at"])
             except Exception:
                 continue
-            pts.append((log_time(t, t0), math.log(float(p))))
+            pts.append((log_time(t, t0), math.log(float(p)),
+                        recency_weight(t, checkpoint)))
     d = 0.0
     if len(pts) >= 2:
         xs = [q[0] for q in pts]
         if max(xs) - min(xs) > 1e-9:
-            res = ols(xs, [q[1] for q in pts])
+            res = wols(xs, [q[1] for q in pts], [q[2] for q in pts])
             if res is not None:
                 d = clamp(res[1], 0.0, D_CAP)
     p_t = p_last * math.exp(d * (x_target - x_last))
@@ -264,7 +287,7 @@ def forecast_case(case):
             x_last = 0.0
 
     p_target = p_last if flat else fit_players(
-        reads, t0, x_target, p_last, x_last)
+        reads, t0, x_target, p_last, x_last, at)
 
     # Hours since launch, for the flat-history dilution prior. The
     # stale page was last fresh at or before the first read, so the
@@ -279,7 +302,7 @@ def forecast_case(case):
             h_stale = 0.0
     flat_factor = ((1.0 + h_target) / (1.0 + h_stale)) ** (B_PRIOR - D_PRIOR)
 
-    # Per-trophy series over the distinct reads: (x, rate, players).
+    # Per-trophy series over the distinct reads: (x, rate, players, w).
     n = len(trophies)
     series = []
     for j in range(n):
@@ -293,7 +316,8 @@ def forecast_case(case):
                     t = parse_time(r["at"])
                 except Exception:
                     continue
-                pts.append((log_time(t, t0), float(rates[j]), float(p)))
+                pts.append((log_time(t, t0), float(rates[j]), float(p),
+                            recency_weight(t, at)))
         series.append(pts)
 
     # First pass: raw slopes and residual scales, per trophy.
@@ -311,7 +335,8 @@ def forecast_case(case):
         if len(pts) >= 2:
             xs = [q[0] for q in pts]
             if max(xs) - min(xs) > 1e-9:
-                res1 = ols(xs, [logit(q[1]) for q in pts])
+                ws = [q[3] for q in pts]
+                res1 = wols(xs, [logit(q[1]) for q in pts], ws)
                 if res1 is not None:
                     beta = clamp(res1[1], -BETA_CAP, BETA_CAP)
                     s = res1[2]
@@ -319,7 +344,7 @@ def forecast_case(case):
                     sxx = res1[4]
                 us = [math.log(max(q[1] * q[2] / 100.0, 0.5))
                       for q in pts]
-                res2 = ols(xs, us)
+                res2 = wols(xs, us, ws)
                 if res2 is not None:
                     b_slope = clamp(res2[1], 0.0, B_CAP)
         raw_beta.append(beta)
@@ -403,7 +428,8 @@ def forecast_case(case):
         med_logit = 0.5 * (logit1 + logit2)
         # Spread: regression prediction error, view disagreement,
         # horizon term. The leverage term is capped so a clustered
-        # history cannot blow the band up without bound.
+        # history cannot blow the band up without bound. The total is
+        # calibrated (SIGMA_SCALE) toward ~90% coverage.
         s_eff = resid[j] if (resid[j] is not None and npts >= 4) else 0.3
         s_fit = max(s_eff, 0.5 * s_pool)
         if xbar_of[j] is not None and sxx_of[j] and sxx_of[j] > 0:
@@ -414,7 +440,8 @@ def forecast_case(case):
         sigma_pred = s_fit * math.sqrt(max(pred_var, 1.0))
         sigma_dis = abs(logit1 - logit2) / 2.0
         sigma = math.sqrt(sigma_pred ** 2 + sigma_dis ** 2 + sigma_h ** 2)
-        rows.append((tid, med_logit, clamp(sigma, SIGMA_FLOOR, SIGMA_CAP)))
+        sigma = clamp(sigma * SIGMA_SCALE, SIGMA_FLOOR, SIGMA_CAP)
+        rows.append((tid, med_logit, sigma))
     return rows
 
 
